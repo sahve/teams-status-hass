@@ -18,5 +18,5 @@ $logDir = "$env:LocalAppData\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft
 # Waar de laatst-verstuurde status lokaal wordt bijgehouden (voorkomt dubbele webhook-calls).
 $stateFile = "$env:TEMP\teams_ha_state.txt"
 
-# Hoe vaak (in seconden) het script de logs checkt.
-$pollIntervalSeconds = 5
+# Hoe vaak (in seconden) het script de logs checkt. Wegens filechange-events kan dit hoger dan 5 seconden gezet worden
+$pollIntervalSeconds = 15

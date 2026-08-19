@@ -9,6 +9,13 @@
 # Vereist: config.ps1 in dezelfde map (kopieer config.example.ps1).
 # ============================================================
 
+param(
+    # Voer een testrun uit: stuur een reeks sample-payloads (alle statussen
+    # + call-state) met 5 seconden ertussen en stop daarna. Handig om te
+    # controleren of de webhook + Home Assistant-integratie werken.
+    [switch]$test
+)
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $configPath = Join-Path $PSScriptRoot "config.ps1"
@@ -17,6 +24,24 @@ if (-not (Test-Path $configPath)) {
     exit 1
 }
 . $configPath
+
+# Verwijdert gevoelige gegevens (webhook-URL + het niet-raadbare webhook-ID)
+# uit foutmeldingen, zodat ze nooit in de CLI-logs terechtkomen.
+function Redact-Secret {
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+
+    # Het webhook-ID (het deel na /webhook/) is het echte geheim; het domein
+    # is minder gevoelig maar redacten we voor de zekerheid ook.
+    $webhookId = $null
+    if ($webhookUrl -match '/([^/?#]+)/?$') {
+        $webhookId = $Matches[1]
+    }
+    if ($webhookUrl) { $Text = $Text.Replace($webhookUrl, "[WEBHOOK-URL]") }
+    if ($webhookId)  { $Text = $Text.Replace($webhookId,  "[WEBHOOK-ID]") }
+
+    return $Text
+}
 
 function Get-TeamsStatus {
     param($LatestLogPath)
@@ -63,7 +88,62 @@ function Send-StatusUpdate {
     Invoke-RestMethod @params
 }
 
+# --- Testmodus: stuur sample-payloads en stop ---
+if ($test) {
+    Write-Host "Testmodus: stuur sample-payloads naar de webhook en stop daarna." -ForegroundColor Cyan
+    if ($proxyUrl) { Write-Host "Proxy: $proxyUrl" }
+
+    # Statussen zonder gesprek, daarna met gesprek.
+    $samples = @(
+        @{ status = "Available"; in_call = $false },
+        @{ status = "Busy";     in_call = $false },
+        @{ status = "Away";     in_call = $false },
+        @{ status = "Available"; in_call = $true  },
+        @{ status = "Busy";     in_call = $true  },
+        @{ status = "Available"; in_call = $false }
+    )
+
+    foreach ($sample in $samples) {
+        Write-Host ("-> status={0,-9} in_call={1}" -f $sample.status, $sample.in_call) -NoNewline
+        try {
+            Send-StatusUpdate -Status $sample.status -InCall $sample.in_call
+            Write-Host "  [OK]" -ForegroundColor Green
+        } catch {
+            Write-Host "  [FOUT: $(Redact-Secret $_.Exception.Message)]" -ForegroundColor Red
+        }
+
+        # Geen sleep na het laatste sample.
+        if ($sample -ne $samples[-1]) {
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    Write-Host "Testmodus klaar." -ForegroundColor Cyan
+    exit 0
+}
+
 Write-Host "Teams status -> Home Assistant gestart. Ctrl+C om te stoppen."
+
+# Bestandswatcher op de Teams-logmap. In plaats van een vaste sleep wachten we
+# passief op een wijziging (lagere latency, geen periodieke wake-ups). De timeout
+# (pollIntervalSeconds) is alleen een veiligheidsnet voor gemiste events, bv. bij
+# logrotatie: dan wordt er een nieuw bestand aangemaakt, niet alleen geschreven.
+# Als de map niet bestaat (bv. de nieuwe Teams-client is nog niet geïnstalleerd)
+# of de watcher niet aangemaakt kan worden, valt het script terug op polling.
+$watcher = $null
+if (Test-Path $logDir) {
+    try {
+        $watcher = [System.IO.FileSystemWatcher]::new($logDir, "MSTeams_20*.log")
+        $watcher.IncludeSubdirectories = $false
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite -bor
+                                [System.IO.NotifyFilters]::FileName
+    } catch {
+        Write-Warning "Kon geen bestandswatcher aanmaken, val terug op polling: $($_.Exception.Message)"
+        $watcher = $null
+    }
+} else {
+    Write-Warning "Logmap niet gevonden: $logDir"
+}
 
 while ($true) {
     $latestLog = Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
@@ -93,10 +173,20 @@ while ($true) {
                 # volgende iteratie opnieuw geprobeerd wordt.
                 Set-Content -Path $stateFile -Value @($status, $inCall.ToString())
             } catch {
-                Write-Warning "Kon status niet versturen: $($_.Exception.Message)"
+                Write-Warning "Kon status niet versturen: $(Redact-Secret $_.Exception.Message)"
             }
         }
     }
 
-    Start-Sleep -Seconds $pollIntervalSeconds
+    # Wacht tot het logbestand wijzigt of roteert. Bij timeout (geen wijziging
+    # binnen pollIntervalSeconds) loopt de lus gewoon door en wordt er opnieuw
+    # gecheckt; dat vangt eventuele gemiste events op.
+    if ($watcher) {
+        $null = $watcher.WaitForChanged(
+            [System.IO.WatcherChangeTypes]::All,
+            $pollIntervalSeconds * 1000
+        )
+    } else {
+        Start-Sleep -Seconds $pollIntervalSeconds
+    }
 }

@@ -13,7 +13,11 @@ param(
     # Voer een testrun uit: stuur een reeks sample-payloads (alle statussen
     # + call-state) met 5 seconden ertussen en stop daarna. Handig om te
     # controleren of de webhook + Home Assistant-integratie werken.
-    [switch]$test
+    [switch]$test,
+
+    # Draai als icoon in het systeemvak (rechtsonder naast de klok) in plaats
+    # van in een consolevenster. Rechtsklik op het icoon om af te sluiten.
+    [switch]$tray
 )
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -88,6 +92,51 @@ function Send-StatusUpdate {
     Invoke-RestMethod @params
 }
 
+function Get-LatestTeamsLog {
+    Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+# Eén controle-ronde: logs lezen en bij een wijziging (of met -Force altijd)
+# een update sturen. Geeft de huidige waarden terug, of $null als er geen
+# logbestand is, zodat de tray-modus ze kan tonen.
+function Invoke-StatusCheck {
+    param($LatestLog, [switch]$Force)
+
+    if (-not $LatestLog) { return $null }
+
+    # --- Vorige state inlezen ---
+    $lastStatus = ""
+    $lastInCall = $false
+    if (Test-Path $stateFile) {
+        $saved = Get-Content $stateFile
+        if ($saved.Count -ge 2) {
+            $lastStatus = $saved[0]
+            $lastInCall = [bool]::Parse($saved[1])
+        }
+    }
+
+    $status = Get-TeamsStatus -LatestLogPath $LatestLog.FullName
+    $inCall = Get-TeamsCallState -LatestLogPath $LatestLog.FullName -PreviousInCall $lastInCall
+    $sendError = $null
+
+    # --- Alleen versturen bij wijziging ---
+    if ($Force -or $status -ne $lastStatus -or $inCall -ne $lastInCall) {
+        try {
+            Send-StatusUpdate -Status $status -InCall $inCall
+            # State pas opslaan na een geslaagde POST, zodat een gemiste
+            # wijziging (bv. door een tijdelijke netwerkstoring) bij de
+            # volgende iteratie opnieuw geprobeerd wordt.
+            Set-Content -Path $stateFile -Value @($status, $inCall.ToString())
+        } catch {
+            $sendError = Redact-Secret $_.Exception.Message
+            Write-Warning "Kon status niet versturen: $sendError"
+        }
+    }
+
+    return @{ Status = $status; InCall = $inCall; Error = $sendError }
+}
+
 # --- Testmodus: stuur sample-payloads en stop ---
 if ($test) {
     Write-Host "Testmodus: stuur sample-payloads naar de webhook en stop daarna." -ForegroundColor Cyan
@@ -122,6 +171,131 @@ if ($test) {
     exit 0
 }
 
+# --- Tray-modus: icoon in het systeemvak, geen consolevenster ---
+if ($tray) {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+
+    # Maximaal één tray-icoon tegelijk (bv. als het script twee keer gestart wordt).
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($true, "Local\TeamsStatusHass", [ref]$createdNew)
+    if (-not $createdNew) { exit 0 }
+
+    # Eigen consolevenster verbergen, voor als het script niet al verborgen
+    # gestart is (zie README voor starten zonder zichtbaar venster). Alleen als
+    # dit proces de enige gebruiker van de console is, zodat een PowerShell-
+    # venster waaruit je het script handmatig start niet verdwijnt.
+    try {
+        Add-Type -Namespace Win32 -Name ConsoleWindow -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] list, uint count);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+        $hwnd = [Win32.ConsoleWindow]::GetConsoleWindow()
+        $consoleProcs = [Win32.ConsoleWindow]::GetConsoleProcessList([uint32[]]::new(16), 16)
+        if ($hwnd -ne [IntPtr]::Zero -and $consoleProcs -eq 1) {
+            $null = [Win32.ConsoleWindow]::ShowWindow($hwnd, 0)
+        }
+    } catch { }
+
+    # Gekleurd bolletje per status; wit stipje in het midden = in gesprek.
+    # Iconen worden gecachet omdat GetHicon() een handle alloceert.
+    $iconCache = @{}
+    function Get-StatusIcon {
+        param($Status, $InCall)
+
+        $color = switch -Regex ($Status) {
+            '^Available$'                                         { '#6BB700'; break }
+            '^(Busy|DoNotDisturb|InACall|InAMeeting|Presenting)$' { '#C4314B'; break }
+            '^(Away|BeRightBack)$'                                { '#FFAA44'; break }
+            default                                               { '#8A8886' }
+        }
+        $key = "$color|$InCall"
+        if (-not $iconCache.ContainsKey($key)) {
+            $bmp = [System.Drawing.Bitmap]::new(16, 16)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $brush = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml($color))
+            $g.FillEllipse($brush, 1, 1, 14, 14)
+            if ($InCall) { $g.FillEllipse([System.Drawing.Brushes]::White, 5, 5, 6, 6) }
+            $brush.Dispose()
+            $g.Dispose()
+            $iconCache[$key] = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        }
+        return $iconCache[$key]
+    }
+
+    function Update-TrayDisplay {
+        param($Result)
+
+        if (-not $Result) {
+            $text = "Teams: geen logbestand gevonden"
+            $notify.Icon = Get-StatusIcon -Status "Unknown" -InCall $false
+        } else {
+            $text = "Teams: $($Result.Status)"
+            if ($Result.InCall) { $text += " (in gesprek)" }
+            if ($Result.Error)  { $text += " - versturen mislukt" }
+            $notify.Icon = Get-StatusIcon -Status $Result.Status -InCall $Result.InCall
+        }
+        # NotifyIcon.Text mag maximaal 63 tekens zijn.
+        if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
+        $notify.Text = $text
+        $statusItem.Text = $text
+    }
+
+    $notify = [System.Windows.Forms.NotifyIcon]::new()
+    $menu = [System.Windows.Forms.ContextMenuStrip]::new()
+    $statusItem = $menu.Items.Add("Teams: opstarten...")
+    $statusItem.Enabled = $false
+    $null = $menu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
+    $resendItem = $menu.Items.Add("Status opnieuw versturen")
+    $quitItem = $menu.Items.Add("Afsluiten")
+    $notify.ContextMenuStrip = $menu
+    $notify.Icon = Get-StatusIcon -Status "Unknown" -InCall $false
+    $notify.Text = "Teams: opstarten..."
+    $notify.Visible = $true
+
+    # In plaats van te blokkeren op de FileSystemWatcher (dat zou het menu
+    # bevriezen) kijkt een timer elke 2 seconden goedkoop of het nieuwste
+    # logbestand veranderd is (naam, grootte, schrijftijd). Alleen dan worden
+    # de logs gelezen. Elke pollIntervalSeconds volgt sowieso een controle,
+    # zodat een mislukte POST opnieuw geprobeerd wordt.
+    $lastSignature = $null
+    $lastCheck = [datetime]::MinValue
+    $timer = [System.Windows.Forms.Timer]::new()
+    $timer.Interval = 2000
+    $timer.add_Tick({
+        $timer.Stop()
+        try {
+            $log = Get-LatestTeamsLog
+            $signature = if ($log) { "$($log.FullName)|$($log.Length)|$($log.LastWriteTimeUtc.Ticks)" } else { "" }
+            $due = ((Get-Date) - $script:lastCheck).TotalSeconds -ge $pollIntervalSeconds
+            if ($signature -ne $script:lastSignature -or $due) {
+                $script:lastSignature = $signature
+                $script:lastCheck = Get-Date
+                Update-TrayDisplay (Invoke-StatusCheck -LatestLog $log)
+            }
+        } finally {
+            $timer.Start()
+        }
+    })
+
+    $resendItem.add_Click({
+        Update-TrayDisplay (Invoke-StatusCheck -LatestLog (Get-LatestTeamsLog) -Force)
+    })
+    $quitItem.add_Click({
+        $timer.Stop()
+        $notify.Visible = $false
+        [System.Windows.Forms.Application]::Exit()
+    })
+
+    $timer.Start()
+    [System.Windows.Forms.Application]::Run()
+
+    $notify.Dispose()
+    $mutex.ReleaseMutex()
+    exit 0
+}
+
 Write-Host "Teams status -> Home Assistant gestart. Ctrl+C om te stoppen."
 
 # Bestandswatcher op de Teams-logmap. In plaats van een vaste sleep wachten we
@@ -146,37 +320,7 @@ if (Test-Path $logDir) {
 }
 
 while ($true) {
-    $latestLog = Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
-    if ($latestLog) {
-        # --- Vorige state inlezen ---
-        $lastStatus = ""
-        $lastInCall = $false
-        if (Test-Path $stateFile) {
-            $saved = Get-Content $stateFile
-            if ($saved.Count -ge 2) {
-                $lastStatus = $saved[0]
-                $lastInCall = [bool]::Parse($saved[1])
-            }
-        }
-
-        $status = Get-TeamsStatus -LatestLogPath $latestLog.FullName
-        $inCall = Get-TeamsCallState -LatestLogPath $latestLog.FullName -PreviousInCall $lastInCall
-
-        # --- Alleen versturen bij wijziging ---
-        if ($status -ne $lastStatus -or $inCall -ne $lastInCall) {
-            try {
-                Send-StatusUpdate -Status $status -InCall $inCall
-                # State pas opslaan na een geslaagde POST, zodat een gemiste
-                # wijziging (bv. door een tijdelijke netwerkstoring) bij de
-                # volgende iteratie opnieuw geprobeerd wordt.
-                Set-Content -Path $stateFile -Value @($status, $inCall.ToString())
-            } catch {
-                Write-Warning "Kon status niet versturen: $(Redact-Secret $_.Exception.Message)"
-            }
-        }
-    }
+    $null = Invoke-StatusCheck -LatestLog (Get-LatestTeamsLog)
 
     # Wacht tot het logbestand wijzigt of roteert. Bij timeout (geen wijziging
     # binnen pollIntervalSeconds) loopt de lus gewoon door en wordt er opnieuw

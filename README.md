@@ -48,11 +48,33 @@ Als je HA-instantie alleen lokaal bereikbaar is, moet je 'm extern (of via VPN/T
    powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\teams-status.ps1"
    ```
    Wissel je Teams-status en controleer in Home Assistant (**Ontwikkelaarshulpmiddelen → Staten**, zoek op `teams`) of `sensor.teams_status` meebeweegt.
-4. Stop het testscript (Ctrl+C) en zet 'm in Task Scheduler zodat hij automatisch start:
-   - Trigger: "At log on" (geen herhaling nodig — het script draait zelf continu in een lus)
-   - Actie: `powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Scripts\teams-status.ps1"`
-   - Conditions: "Start the task only if the computer is on AC power" **uit**
-   - Settings: "Do not start a new instance" als er al een instantie draait
+   Alleen de webhook testen kan ook, met `-test`: dan worden een paar voorbeeldstatussen verstuurd en stopt het script.
+4. Stop het testscript (Ctrl+C) en zet 'm in Task Scheduler zodat hij automatisch start (zie hieronder).
+
+### 4. Op de achtergrond draaien, met icoon naast de klok
+
+Met `-tray` draait het script zonder consolevenster, als een gekleurd bolletje in het systeemvak rechtsonder:
+
+| Icoon | Betekenis |
+|---|---|
+| 🟢 groen | Available |
+| 🔴 rood | Busy / Do not disturb |
+| 🟠 oranje | Away / Be right back |
+| ⚪ grijs | Offline / onbekend |
+| wit stipje in het midden | je zit in een gesprek |
+
+Beweeg met de muis over het icoon om de status te zien (en of het versturen mislukt is). Via rechtsklik kun je de status opnieuw versturen of het script afsluiten. Er draait altijd maar één tray-icoon tegelijk.
+
+Zet het in Task Scheduler:
+- Trigger: "At log on" (geen herhaling nodig — het script draait zelf continu)
+- Actie: programma `conhost.exe`, argumenten:
+  `--headless powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\teams-status.ps1" -tray`
+- Conditions: "Start the task only if the computer is on AC power" **uit**
+- Settings: "Do not start a new instance" als er al een instantie draait
+
+`conhost.exe --headless` zorgt dat er helemaal geen venster verschijnt, ook niet heel even (op Windows 11 opent `powershell.exe -WindowStyle Hidden` anders toch kort een Terminal-venster). Werkt dat op jouw Windows-versie niet, gebruik dan als programma `powershell.exe` met de argumenten `-WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Scripts\teams-status.ps1" -tray`. Het script verbergt zijn eigen venster dan zelf, maar je ziet het misschien heel even flitsen bij het inloggen.
+
+Pin het icoon eventueel vast via **Instellingen → Persoonlijke instellingen → Taakbalk → Andere systeemvakpictogrammen**, anders staat het achter het pijltje `^`.
 
 ## Troubleshooting
 

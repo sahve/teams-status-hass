@@ -4,11 +4,16 @@ Stuur je Microsoft Teams-status (Available/Busy/Away/...) en of je in een gespre
 
 ## Hoe het werkt
 
-De nieuwe Teams-desktopclient logt lokaal presence- en call-events naar platte tekstbestanden. Dit project leest die logs, en post bij elke wijziging een klein JSON-bericht naar een Home Assistant webhook:
+De nieuwe Teams-desktopclient logt lokaal presence- en call-events naar platte tekstbestanden. Dit project leest die logs (alleen de nieuw geschreven regels, elke 2 seconden), en post bij elke wijziging een klein JSON-bericht naar een Home Assistant webhook:
 
 ```json
 { "status": "Busy", "in_call": true }
 ```
+
+Daarnaast:
+- Elke 5 minuten wordt de status ook zonder wijziging opnieuw verstuurd (heartbeat). Zo komt HA na een herstart vanzelf weer bij, en zet HA de status op `Offline` / niet in gesprek als de heartbeat 15 minuten uitblijft (laptop uit of in slaapstand).
+- Is Teams afgesloten of gecrasht, dan wordt `Offline` en niet in gesprek gemeld, zodat "in gesprek" niet blijft hangen.
+- Bij meerdere gelijktijdige gesprekken (bv. één in de wacht) telt het script mee: je bent pas uit gesprek als het laatste gesprek eindigt.
 
 Geen cloud-tussenlaag, geen extra software op je laptop buiten PowerShell (ingebouwd in Windows).
 
@@ -20,17 +25,17 @@ Geen cloud-tussenlaag, geen extra software op je laptop buiten PowerShell (ingeb
 ## Vereisten
 
 - Windows met de nieuwe Microsoft Teams-client
-- Een Home Assistant-instantie die (op zijn minst voor de webhook) bereikbaar is vanaf je laptop
+- Home Assistant 2024.10 of nieuwer, (op zijn minst voor de webhook) bereikbaar vanaf je laptop
 - PowerShell (standaard aanwezig op Windows)
 
 ## Installatie
 
 ### 1. Home Assistant
 
-1. Kopieer `homeassistant/packages/teams_status.yaml` naar de `packages/`-map van je HA-configuratie (zorg dat `packages: !include_dir_named packages` in je `configuration.yaml` staat).
+1. Kopieer `teams_status.yaml` naar de `packages/`-map van je HA-configuratie (zorg dat `packages: !include_dir_named packages` in je `configuration.yaml` staat).
 2. Genereer een willekeurig webhook-ID: in PowerShell, `[guid]::NewGuid()`. Vul dit in op de plek van `<YOUR_WEBHOOK_ID>` in het YAML-bestand. Gebruik geen voorspelbare naam — dit endpoint is straks (indirect) publiek bereikbaar.
 3. Herstart Home Assistant volledig (niet alleen een YAML-reload — webhook-registratie gebeurt bij het opstarten).
-4. Optioneel: kopieer `homeassistant/automations/example-teams-light.yaml` als startpunt voor een automation die iets doet met de status.
+4. Optioneel: gebruik `example-teams-light.yaml` als startpunt voor een automation die iets doet met de status (plakken in `automations.yaml`; zie de uitleg bovenin het bestand).
 
 ### 2. Home Assistant bereikbaar maken vanaf je laptop
 
@@ -41,8 +46,8 @@ Als je HA-instantie alleen lokaal bereikbaar is, moet je 'm extern (of via VPN/T
 
 ### 3. Het script
 
-1. Kopieer de hele `scripts/`-map naar bijvoorbeeld `C:\Scripts\` op je laptop.
-2. Kopieer `config.example.ps1` naar `config.ps1` en vul je eigen webhook-URL in (en proxy-adres, als je daarachter zit).
+1. Kopieer `teams-status.ps1` en `config.example.ps1` naar bijvoorbeeld `C:\Scripts\` op je laptop.
+2. Kopieer `config.example.ps1` naar `config.ps1` en vul je eigen webhook-URL in (en proxy-adres, als je daarachter zit). De overige instellingen (heartbeat, Teams-procesnaam, ...) hebben goede standaardwaarden; een oudere `config.ps1` zonder die regels blijft gewoon werken.
 3. Test handmatig:
    ```powershell
    powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\teams-status.ps1"
@@ -84,7 +89,8 @@ Pin het icoon eventueel vast via **Instellingen → Persoonlijke instellingen �
 | `Invalid package definition ...: invalid slug` in HA-logs | Bestandsnaam bevat een `-` | Hernoem naar underscores, bv. `teams_status.yaml` |
 | `407 Proxy Authentication Required` | Bedrijfsproxy vereist authenticatie | Vul `$proxyUrl` in `config.ps1` in — het script gebruikt automatisch je Windows-inlog voor de proxy |
 | `Could not create SSL/TLS secure channel` | Verouderd TLS-protocol, of (bij bedrijfsnetwerken) domeinreputatie-blokkade | Script forceert al TLS 1.2; test of een ander, langer bestaand subdomein op dezelfde server wél werkt om te zien of het domein-specifiek is |
-| Sensor blijft oude waarde tonen | State-file bevat al dezelfde status, dus er wordt terecht niets verstuurd | Verwijder `%TEMP%\teams_ha_state.txt` om een verse melding te forceren |
+| Sensor blijft oude waarde tonen | Script draait niet, of versturen mislukt | Kijk in de tooltip van het tray-icoon ("versturen mislukt") of in het consolevenster; via rechtsklik → *Status opnieuw versturen* forceer je een melding |
+| Status springt steeds naar `Offline` terwijl Teams draait | Het Teams-proces heet op jouw laptop anders | Zoek de naam op met `Get-Process *teams*` en zet die in `$teamsProcessName` in `config.ps1` (of `""` om de controle uit te zetten) |
 | Geen `availability:`-regels te vinden in de logs | Microsoft heeft het logformaat gewijzigd | Zoek handmatig met `Select-String -Path <logbestand> -Pattern "availability","presence"` naar het huidige patroon en pas het script aan |
 
 ## Hoe de logs eruitzien

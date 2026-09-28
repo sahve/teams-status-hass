@@ -6,21 +6,54 @@
 #   homeassistant:
 #     packages: !include_dir_named packages
 #
+# Vereist Home Assistant 2024.10 of nieuwer (triggers:/trigger:-syntax).
+#
 # Vervang <YOUR_WEBHOOK_ID> door een zelf gegenereerde GUID
 # (PowerShell: [guid]::NewGuid()) -- gebruik nooit een voorspelbare
 # waarde, dit endpoint is straks publiek bereikbaar.
+#
+# Het script stuurt elke 5 minuten een heartbeat ($heartbeatMinutes). Blijft
+# die 15 minuten uit (laptop uit/slaapstand, script gestopt), dan gaat de
+# status naar "Offline" en "in gesprek" naar uit, zodat een bezet-lampje niet
+# blijft branden. Houd de 15 minuten ruim groter dan $heartbeatMinutes.
 
 template:
-  - trigger:
-      - platform: webhook
+  - triggers:
+      - trigger: webhook
         webhook_id: "<YOUR_WEBHOOK_ID>"
         allowed_methods: ["POST"]
         local_only: false
+        id: webhook
+      - trigger: time_pattern
+        minutes: "/1"
+        id: check
     sensor:
       - name: "Teams status"
         unique_id: teams_status
-        state: "{{ trigger.json.status }}"
+        state: >
+          {% set seen = this.attributes.last_seen | default(none) %}
+          {% if trigger.id == 'webhook' %}
+            {{ trigger.json.status }}
+          {% elif seen and now() - as_datetime(seen) > timedelta(minutes=15) %}
+            Offline
+          {% else %}
+            {{ this.state }}
+          {% endif %}
+        attributes:
+          last_seen: >
+            {{ now().isoformat() if trigger.id == 'webhook' else this.attributes.last_seen | default(none) }}
     binary_sensor:
       - name: "Teams in gesprek"
         unique_id: teams_in_gesprek
-        state: "{{ trigger.json.in_call }}"
+        state: >
+          {% set seen = this.attributes.last_seen | default(none) %}
+          {% if trigger.id == 'webhook' %}
+            {{ trigger.json.in_call }}
+          {% elif seen and now() - as_datetime(seen) > timedelta(minutes=15) %}
+            off
+          {% else %}
+            {{ this.state }}
+          {% endif %}
+        attributes:
+          last_seen: >
+            {{ now().isoformat() if trigger.id == 'webhook' else this.attributes.last_seen | default(none) }}

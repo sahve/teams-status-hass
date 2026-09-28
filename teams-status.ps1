@@ -20,7 +20,10 @@ param(
     [switch]$tray
 )
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# TLS 1.2 toevoegen aan (niet: in plaats van) de standaardprotocollen, zodat
+# TLS 1.3 beschikbaar blijft waar het systeem dat ondersteunt.
+[Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $configPath = Join-Path $PSScriptRoot "config.ps1"
 if (-not (Test-Path $configPath)) {
@@ -28,6 +31,16 @@ if (-not (Test-Path $configPath)) {
     exit 1
 }
 . $configPath
+
+# Standaardwaarden voor instellingen die in een oudere config.ps1 ontbreken.
+if ($null -eq $logDir)              { $logDir = "$env:LocalAppData\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs" }
+if ($null -eq $pollIntervalSeconds) { $pollIntervalSeconds = 15 }
+if ($null -eq $heartbeatMinutes)    { $heartbeatMinutes = 5 }
+if ($null -eq $teamsProcessName)    { $teamsProcessName = "ms-teams" }
+
+# Hoe vaak (in milliseconden) de logs gecontroleerd worden. Dat is goedkoop:
+# alleen de nieuw geschreven regels worden gelezen.
+$checkIntervalMs = 2000
 
 # Verwijdert gevoelige gegevens (webhook-URL + het niet-raadbare webhook-ID)
 # uit foutmeldingen, zodat ze nooit in de CLI-logs terechtkomen.
@@ -45,28 +58,6 @@ function Redact-Secret {
     if ($webhookId)  { $Text = $Text.Replace($webhookId,  "[WEBHOOK-ID]") }
 
     return $Text
-}
-
-function Get-TeamsStatus {
-    param($LatestLogPath)
-
-    $statusLine = Select-String -Path $LatestLogPath -Pattern "availability:\s*(\w+)" |
-        Select-Object -Last 1
-
-    if ($statusLine) { $statusLine.Matches[0].Groups[1].Value } else { "Unknown" }
-}
-
-function Get-TeamsCallState {
-    param($LatestLogPath, $PreviousInCall)
-
-    $callLine = Select-String -Path $LatestLogPath -Pattern "TeamsCallTracker: Call (became active|ended):" |
-        Select-Object -Last 1
-
-    # Geen call-event gevonden in dit (mogelijk net geroteerde) logbestand?
-    # Dan de vorige bekende call-state behouden i.p.v. een gok te maken.
-    if (-not $callLine) { return $PreviousInCall }
-
-    return ($callLine.Line -match "became active")
 }
 
 function Send-StatusUpdate {
@@ -92,49 +83,158 @@ function Send-StatusUpdate {
     Invoke-RestMethod @params
 }
 
-function Get-LatestTeamsLog {
+function Get-TeamsLogs {
     Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Sort-Object LastWriteTime -Descending
 }
 
-# Eén controle-ronde: logs lezen en bij een wijziging (of met -Force altijd)
-# een update sturen. Geeft de huidige waarden terug, of $null als er geen
-# logbestand is, zodat de tray-modus ze kan tonen.
-function Invoke-StatusCheck {
-    param($LatestLog, [switch]$Force)
+function Test-TeamsRunning {
+    if (-not $teamsProcessName) { return $true }
+    return [bool](Get-Process -Name $teamsProcessName -ErrorAction SilentlyContinue)
+}
 
-    if (-not $LatestLog) { return $null }
+# --- Log-lezer -------------------------------------------------------------
+# Houdt bij tot waar het huidige logbestand gelezen is, zodat bij elke
+# controle alleen de nieuwe regels gelezen worden in plaats van het hele
+# (vaak meerdere MB grote) bestand.
+$script:logPath   = $null
+$script:logOffset = 0L
 
-    # --- Vorige state inlezen ---
-    $lastStatus = ""
-    $lastInCall = $false
-    if (Test-Path $stateFile) {
-        $saved = Get-Content $stateFile
-        if ($saved.Count -ge 2) {
-            $lastStatus = $saved[0]
-            $lastInCall = [bool]::Parse($saved[1])
-        }
+# Laatst bekende waarden uit de logs. Die blijven behouden als Teams naar een
+# nieuw logbestand overschakelt: zo'n vers bestand bevat vaak nog geen
+# status- of call-regel.
+$script:teamsStatus = "Unknown"
+$script:teamsInCall = $false
+
+function Read-NewLogLines {
+    param($LogFile)
+
+    # Nieuw logbestand (rotatie) of ingekort bestand: vooraan beginnen.
+    if ($LogFile.FullName -ne $script:logPath -or $LogFile.Length -lt $script:logOffset) {
+        $script:logPath   = $LogFile.FullName
+        $script:logOffset = 0L
+    }
+    if ($LogFile.Length -le $script:logOffset) { return @() }
+
+    # FileShare.ReadWrite: Teams heeft het bestand open om naar te schrijven.
+    $stream = [System.IO.File]::Open($LogFile.FullName, 'Open', 'Read', 'ReadWrite')
+    try {
+        $null = $stream.Seek($script:logOffset, 'Begin')
+        $buffer = [System.IO.MemoryStream]::new()
+        $stream.CopyTo($buffer)
+        $bytes = $buffer.ToArray()
+    } finally {
+        $stream.Dispose()
     }
 
-    $status = Get-TeamsStatus -LatestLogPath $LatestLog.FullName
-    $inCall = Get-TeamsCallState -LatestLogPath $LatestLog.FullName -PreviousInCall $lastInCall
-    $sendError = $null
+    # Alleen volledige regels verwerken; een half geschreven laatste regel
+    # wordt bij de volgende controle opnieuw gelezen.
+    $end = [Array]::LastIndexOf($bytes, [byte]10)
+    if ($end -lt 0) { return @() }
+    $script:logOffset += $end + 1
 
-    # --- Alleen versturen bij wijziging ---
-    if ($Force -or $status -ne $lastStatus -or $inCall -ne $lastInCall) {
+    return [System.Text.Encoding]::UTF8.GetString($bytes, 0, $end + 1) -split "`r?`n"
+}
+
+# Verwerkt logregels, bv.:
+#   ... { availability: Busy, unread notification count: 1 }
+#   ... TeamsCallTracker: Call became active: <call-id> (total: 1)
+#   ... TeamsCallTracker: Call ended: <call-id> (remaining: 0)
+function Update-TeamsState {
+    param([string[]]$Lines)
+    if (-not $Lines) { return }
+
+    # Eerst snel filteren (werkt op de hele array tegelijk), dan pas per regel.
+    foreach ($line in ($Lines -match 'availability:|TeamsCallTracker: Call ')) {
+        if ($line -match 'availability:\s*(\w+)') {
+            $script:teamsStatus = $Matches[1]
+        } elseif ($line -match 'TeamsCallTracker: Call (?:became active|ended):.*\((?:total|remaining):\s*(\d+)\)') {
+            # Aantal lopende gesprekken gebruiken, zodat het beëindigen van
+            # één van meerdere gesprekken (wacht, doorverbinden) niet als
+            # "niet meer in gesprek" telt.
+            $script:teamsInCall = [int]$Matches[1] -gt 0
+        } elseif ($line -match 'TeamsCallTracker: Call (became active|ended):') {
+            $script:teamsInCall = $Matches[1] -eq 'became active'
+        }
+    }
+}
+
+# Bij de allereerste controle: als het nieuwste logbestand nog geen
+# status-regel bevat (net geroteerd), de laatste status uit het vorige
+# logbestand halen i.p.v. "Unknown" te melden.
+function Initialize-FromPreviousLog {
+    param($PreviousLog)
+
+    if ($script:teamsStatus -ne "Unknown" -or -not $PreviousLog) { return }
+    $statusLine = Select-String -Path $PreviousLog.FullName -Pattern "availability:\s*(\w+)" |
+        Select-Object -Last 1
+    if ($statusLine) { $script:teamsStatus = $statusLine.Matches[0].Groups[1].Value }
+}
+
+# --- Versturen ---------------------------------------------------------------
+# Laatst succesvol verstuurde waarden (alleen in het geheugen: bij het
+# opstarten wordt de status altijd één keer verstuurd).
+$script:sentStatus   = $null
+$script:sentInCall   = $null
+$script:lastSendTime = [datetime]::MinValue
+$script:lastFailTime = [datetime]::MinValue
+$script:lastError    = $null
+$script:initialized  = $false
+
+# Eén controle-ronde: logs bijwerken en een update sturen bij een wijziging,
+# als de heartbeat verlopen is, of met -Force altijd. Geeft de huidige waarden
+# terug, zodat de tray-modus ze kan tonen.
+function Invoke-StatusCheck {
+    param([switch]$Force)
+
+    if (Test-TeamsRunning) {
+        $logs = @(Get-TeamsLogs)
+        if ($logs.Count -gt 0) {
+            try {
+                Update-TeamsState (Read-NewLogLines $logs[0])
+                if (-not $script:initialized) {
+                    $script:initialized = $true
+                    if ($logs.Count -gt 1) { Initialize-FromPreviousLog $logs[1] }
+                }
+            } catch {
+                Write-Warning "Kon logbestand niet lezen: $($_.Exception.Message)"
+            }
+        }
+        $status = $script:teamsStatus
+        $inCall = $script:teamsInCall
+    } else {
+        # Teams is afgesloten of gecrasht. Er komt dan nooit meer een
+        # "Call ended"-regel, dus de call-state hier resetten zodat die niet
+        # op 'true' blijft hangen.
+        $script:teamsInCall = $false
+        $status = "Offline"
+        $inCall = $false
+    }
+
+    $now = Get-Date
+    $changed = $status -ne $script:sentStatus -or $inCall -ne $script:sentInCall
+    $heartbeatDue = $heartbeatMinutes -gt 0 -and
+        ($now - $script:lastSendTime).TotalMinutes -ge $heartbeatMinutes
+    # Na een mislukte poging pas na pollIntervalSeconds opnieuw proberen, zodat
+    # een onbereikbare HA niet bij elke controle een time-out van 5 s kost.
+    $waitForRetry = $script:lastError -and
+        ($now - $script:lastFailTime).TotalSeconds -lt $pollIntervalSeconds
+
+    if ($Force -or (($changed -or $heartbeatDue) -and -not $waitForRetry)) {
         try {
             Send-StatusUpdate -Status $status -InCall $inCall
-            # State pas opslaan na een geslaagde POST, zodat een gemiste
-            # wijziging (bv. door een tijdelijke netwerkstoring) bij de
-            # volgende iteratie opnieuw geprobeerd wordt.
-            Set-Content -Path $stateFile -Value @($status, $inCall.ToString())
+            $script:sentStatus   = $status
+            $script:sentInCall   = $inCall
+            $script:lastSendTime = $now
+            $script:lastError    = $null
         } catch {
-            $sendError = Redact-Secret $_.Exception.Message
-            Write-Warning "Kon status niet versturen: $sendError"
+            $script:lastError    = Redact-Secret $_.Exception.Message
+            $script:lastFailTime = $now
+            Write-Warning "Kon status niet versturen: $($script:lastError)"
         }
     }
 
-    return @{ Status = $status; InCall = $inCall; Error = $sendError }
+    return @{ Status = $status; InCall = $inCall; Error = $script:lastError }
 }
 
 # --- Testmodus: stuur sample-payloads en stop ---
@@ -169,6 +269,10 @@ if ($test) {
 
     Write-Host "Testmodus klaar." -ForegroundColor Cyan
     exit 0
+}
+
+if (-not (Test-Path $logDir)) {
+    Write-Warning "Logmap niet gevonden: $logDir"
 }
 
 # --- Tray-modus: icoon in het systeemvak, geen consolevenster ---
@@ -227,15 +331,11 @@ if ($tray) {
     function Update-TrayDisplay {
         param($Result)
 
-        if (-not $Result) {
-            $text = "Teams: geen logbestand gevonden"
-            $notify.Icon = Get-StatusIcon -Status "Unknown" -InCall $false
-        } else {
-            $text = "Teams: $($Result.Status)"
-            if ($Result.InCall) { $text += " (in gesprek)" }
-            if ($Result.Error)  { $text += " - versturen mislukt" }
-            $notify.Icon = Get-StatusIcon -Status $Result.Status -InCall $Result.InCall
-        }
+        $text = "Teams: $($Result.Status)"
+        if ($Result.InCall) { $text += " (in gesprek)" }
+        if ($Result.Error)  { $text += " - versturen mislukt" }
+        $notify.Icon = Get-StatusIcon -Status $Result.Status -InCall $Result.InCall
+
         # NotifyIcon.Text mag maximaal 63 tekens zijn.
         if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
         $notify.Text = $text
@@ -254,33 +354,20 @@ if ($tray) {
     $notify.Text = "Teams: opstarten..."
     $notify.Visible = $true
 
-    # In plaats van te blokkeren op de FileSystemWatcher (dat zou het menu
-    # bevriezen) kijkt een timer elke 2 seconden goedkoop of het nieuwste
-    # logbestand veranderd is (naam, grootte, schrijftijd). Alleen dan worden
-    # de logs gelezen. Elke pollIntervalSeconds volgt sowieso een controle,
-    # zodat een mislukte POST opnieuw geprobeerd wordt.
-    $lastSignature = $null
-    $lastCheck = [datetime]::MinValue
+    # Een Forms-timer i.p.v. een blokkerende lus, zodat het menu blijft reageren.
     $timer = [System.Windows.Forms.Timer]::new()
-    $timer.Interval = 2000
+    $timer.Interval = $checkIntervalMs
     $timer.add_Tick({
         $timer.Stop()
         try {
-            $log = Get-LatestTeamsLog
-            $signature = if ($log) { "$($log.FullName)|$($log.Length)|$($log.LastWriteTimeUtc.Ticks)" } else { "" }
-            $due = ((Get-Date) - $script:lastCheck).TotalSeconds -ge $pollIntervalSeconds
-            if ($signature -ne $script:lastSignature -or $due) {
-                $script:lastSignature = $signature
-                $script:lastCheck = Get-Date
-                Update-TrayDisplay (Invoke-StatusCheck -LatestLog $log)
-            }
+            Update-TrayDisplay (Invoke-StatusCheck)
         } finally {
             $timer.Start()
         }
     })
 
     $resendItem.add_Click({
-        Update-TrayDisplay (Invoke-StatusCheck -LatestLog (Get-LatestTeamsLog) -Force)
+        Update-TrayDisplay (Invoke-StatusCheck -Force)
     })
     $quitItem.add_Click({
         $timer.Stop()
@@ -288,6 +375,7 @@ if ($tray) {
         [System.Windows.Forms.Application]::Exit()
     })
 
+    Update-TrayDisplay (Invoke-StatusCheck)
     $timer.Start()
     [System.Windows.Forms.Application]::Run()
 
@@ -296,41 +384,10 @@ if ($tray) {
     exit 0
 }
 
+# --- Consolemodus ---
 Write-Host "Teams status -> Home Assistant gestart. Ctrl+C om te stoppen."
 
-# Bestandswatcher op de Teams-logmap. In plaats van een vaste sleep wachten we
-# passief op een wijziging (lagere latency, geen periodieke wake-ups). De timeout
-# (pollIntervalSeconds) is alleen een veiligheidsnet voor gemiste events, bv. bij
-# logrotatie: dan wordt er een nieuw bestand aangemaakt, niet alleen geschreven.
-# Als de map niet bestaat (bv. de nieuwe Teams-client is nog niet geïnstalleerd)
-# of de watcher niet aangemaakt kan worden, valt het script terug op polling.
-$watcher = $null
-if (Test-Path $logDir) {
-    try {
-        $watcher = [System.IO.FileSystemWatcher]::new($logDir, "MSTeams_20*.log")
-        $watcher.IncludeSubdirectories = $false
-        $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite -bor
-                                [System.IO.NotifyFilters]::FileName
-    } catch {
-        Write-Warning "Kon geen bestandswatcher aanmaken, val terug op polling: $($_.Exception.Message)"
-        $watcher = $null
-    }
-} else {
-    Write-Warning "Logmap niet gevonden: $logDir"
-}
-
 while ($true) {
-    $null = Invoke-StatusCheck -LatestLog (Get-LatestTeamsLog)
-
-    # Wacht tot het logbestand wijzigt of roteert. Bij timeout (geen wijziging
-    # binnen pollIntervalSeconds) loopt de lus gewoon door en wordt er opnieuw
-    # gecheckt; dat vangt eventuele gemiste events op.
-    if ($watcher) {
-        $null = $watcher.WaitForChanged(
-            [System.IO.WatcherChangeTypes]::All,
-            $pollIntervalSeconds * 1000
-        )
-    } else {
-        Start-Sleep -Seconds $pollIntervalSeconds
-    }
+    $null = Invoke-StatusCheck
+    Start-Sleep -Milliseconds $checkIntervalMs
 }

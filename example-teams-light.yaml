@@ -1,18 +1,35 @@
 # Voorbeeld-automation: zet een lamp rood zolang je in een Teams-gesprek zit.
 # Vervang light.your_light_entity door je eigen entity-ID.
+#
+# Plak dit in automations.yaml, of in de UI via Instellingen -> Automatiseringen
+# -> nieuwe automatisering -> (menu rechtsboven) Bewerken in YAML (dan zonder
+# het "- " vooraan en met de rest één niveau minder ingesprongen).
+# Vereist Home Assistant 2024.10 of nieuwer (triggers:/actions:-syntax).
 
-automation:
-  - alias: "Bezet-lamp bij Teams-gesprek"
-    trigger:
-      - platform: state
-        entity_id: binary_sensor.teams_in_gesprek
-    action:
-      - choose:
-          - conditions: "{{ trigger.to_state.state == 'on' }}"
-            sequence:
-              - service: light.turn_on
-                target: { entity_id: light.your_light_entity }
-                data: { color_name: red }
-        default:
-          - service: light.turn_off
-            target: { entity_id: light.your_light_entity }
+- alias: "Bezet-lamp bij Teams-gesprek"
+  triggers:
+    # Alleen reageren op echte aan/uit-wissels, niet op bv. "unavailable"
+    # tijdens een herstart van Home Assistant.
+    - trigger: state
+      entity_id: binary_sensor.teams_in_gesprek
+      to: "on"
+      id: gesprek_start
+    - trigger: state
+      entity_id: binary_sensor.teams_in_gesprek
+      to: "off"
+      id: gesprek_eind
+  actions:
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: gesprek_start
+          sequence:
+            - action: light.turn_on
+              target: { entity_id: light.your_light_entity }
+              data: { color_name: red }
+        - conditions:
+            - condition: trigger
+              id: gesprek_eind
+          sequence:
+            - action: light.turn_off
+              target: { entity_id: light.your_light_entity }

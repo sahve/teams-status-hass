@@ -15,8 +15,15 @@ $proxyUrl = "http://<jouw-proxy-adres>:8080"
 # en hoeft normaal niet aangepast te worden.
 $logDir = "$env:LocalAppData\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs"
 
-# Waar de laatst-verstuurde status lokaal wordt bijgehouden (voorkomt dubbele webhook-calls).
-$stateFile = "$env:TEMP\teams_ha_state.txt"
-
-# Hoe vaak (in seconden) het script de logs checkt. Wegens filechange-events kan dit hoger dan 5 seconden gezet worden
+# Na een mislukte verzending (bv. HA of netwerk even weg) wordt het na zoveel
+# seconden opnieuw geprobeerd.
 $pollIntervalSeconds = 15
+
+# Stuur de status ook zonder wijziging elke zoveel minuten opnieuw ("heartbeat").
+# Zo komt HA na een herstart vanzelf weer bij, en kan HA zien dat je laptop weg
+# is als de heartbeat uitblijft (zie teams_status.yaml). 0 = uit.
+$heartbeatMinutes = 5
+
+# Procesnaam van de nieuwe Teams-client. Draait dit proces niet, dan wordt
+# "Offline" en "niet in gesprek" gemeld. Laat leeg ("") om dit uit te zetten.
+$teamsProcessName = "ms-teams"

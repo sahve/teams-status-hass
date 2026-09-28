@@ -32,6 +32,25 @@ if (-not (Test-Path $configPath)) {
 }
 . $configPath
 
+# Webhook-URL controleren, met een begrijpelijke melding i.p.v. een
+# Invoke-RestMethod-fout bij elke poging. De URL zelf wordt niet getoond,
+# omdat het webhook-ID geheim is.
+$webhookUrl = "$webhookUrl".Trim()
+$parsedUrl = $null
+if (-not [Uri]::TryCreate($webhookUrl, [UriKind]::Absolute, [ref]$parsedUrl) -or
+    $parsedUrl.Scheme -notin @("http", "https") -or
+    $webhookUrl -match '[<>\s]') {
+    $message = "`$webhookUrl in config.ps1 is geen geldige URL. Verwacht iets als " +
+        "https://ha.voorbeeld.nl/api/webhook/<guid>. Staan er nog <...>-placeholders, " +
+        "spaties of een ontbrekende https:// in?"
+    if ($tray) {
+        Add-Type -AssemblyName System.Windows.Forms
+        $null = [System.Windows.Forms.MessageBox]::Show($message, "Teams status -> Home Assistant", "OK", "Error")
+    }
+    Write-Error $message
+    exit 1
+}
+
 # Standaardwaarden voor instellingen die in een oudere config.ps1 ontbreken.
 if ($null -eq $logDir)              { $logDir = "$env:LocalAppData\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs" }
 if ($null -eq $pollIntervalSeconds) { $pollIntervalSeconds = 15 }

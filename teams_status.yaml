@@ -1,6 +1,6 @@
-# Plaats dit bestand in je Home Assistant packages/-map als teams_status.yaml
-# (let op: underscore, geen koppelteken -- HA's package-loader accepteert
-# geen "-" in de bestandsnaam en negeert het bestand anders stilzwijgend).
+# Package-route: plaats dit bestand in je Home Assistant packages/-map als
+# teams_status.yaml (let op: underscore, geen koppelteken -- HA's package-loader
+# accepteert geen "-" in de bestandsnaam en negeert het bestand anders).
 #
 # Vereist dat je configuration.yaml het volgende bevat:
 #   homeassistant:
@@ -8,7 +8,10 @@
 #
 # Vervang <YOUR_WEBHOOK_ID> door een zelf gegenereerde GUID
 # (PowerShell: [guid]::NewGuid()) -- gebruik nooit een voorspelbare
-# waarde, dit endpoint is straks publiek bereikbaar.
+# waarde, dit endpoint is publiek bereikbaar.
+#
+# Liever alles via de UI, of wil je automatische Offline-detectie na
+# stilte? Gebruik dan ha_automation.yaml (helpers + automation).
 
 template:
   - trigger:
@@ -20,7 +23,19 @@ template:
       - name: "Teams status"
         unique_id: teams_status
         state: "{{ trigger.json.status }}"
+      - name: "Teams microfoon app"
+        unique_id: teams_microfoon_app
+        state: "{{ trigger.json.mic_app | default('', true) or 'geen' }}"
+      - name: "Teams camera app"
+        unique_id: teams_camera_app
+        state: "{{ trigger.json.camera_app | default('', true) or 'geen' }}"
     binary_sensor:
       - name: "Teams in gesprek"
         unique_id: teams_in_gesprek
         state: "{{ trigger.json.in_call }}"
+      - name: "Teams microfoon"
+        unique_id: teams_microfoon
+        state: "{{ trigger.json.mic_in_use | default(false) }}"
+      - name: "Teams camera"
+        unique_id: teams_camera
+        state: "{{ trigger.json.camera_on | default(false) }}"

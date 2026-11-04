@@ -1,0 +1,55 @@
+# Home Assistant-automation voor de UI-route (zonder YAML-packages).
+#
+# Maak eerst deze helpers aan (Instellingen -> Apparaten & diensten -> Helpers):
+#   Tekst:  "Teams status"            -> input_text.teams_status
+#   Tekst:  "Teams microfoon app"     -> input_text.teams_microfoon_app
+#   Tekst:  "Teams camera app"        -> input_text.teams_camera_app
+#   Schakelaar: "Teams in gesprek"    -> input_boolean.teams_in_gesprek
+#   Schakelaar: "Teams microfoon"     -> input_boolean.teams_microfoon
+#   Schakelaar: "Teams camera"        -> input_boolean.teams_camera
+#
+# Maak dan een nieuwe automation, kies rechtsboven "Bewerken in YAML",
+# plak dit erin en vervang <YOUR_WEBHOOK_ID>.
+#
+# Offline-detectie: het script stuurt minstens elke 60 s een hartslag.
+# Door "mode: restart" begint de wachttijd onderaan bij elk bericht opnieuw;
+# komt er 3 minuten niets binnen (laptop dicht, geen netwerk, script gestopt),
+# dan gaat alles naar Offline/uit.
+
+alias: Teams status webhook
+triggers:
+  - trigger: webhook
+    webhook_id: "<YOUR_WEBHOOK_ID>"
+    allowed_methods: [POST]
+    local_only: false
+actions:
+  - action: input_text.set_value
+    target: { entity_id: input_text.teams_status }
+    data: { value: "{{ trigger.json.status }}" }
+  - action: "input_boolean.turn_{{ 'on' if trigger.json.in_call else 'off' }}"
+    target: { entity_id: input_boolean.teams_in_gesprek }
+  - action: "input_boolean.turn_{{ 'on' if trigger.json.mic_in_use | default(false) else 'off' }}"
+    target: { entity_id: input_boolean.teams_microfoon }
+  - action: "input_boolean.turn_{{ 'on' if trigger.json.camera_on | default(false) else 'off' }}"
+    target: { entity_id: input_boolean.teams_camera }
+  - action: input_text.set_value
+    target: { entity_id: input_text.teams_microfoon_app }
+    data: { value: "{{ trigger.json.mic_app | default('', true) or 'geen' }}" }
+  - action: input_text.set_value
+    target: { entity_id: input_text.teams_camera_app }
+    data: { value: "{{ trigger.json.camera_app | default('', true) or 'geen' }}" }
+  # --- Offline na 3 minuten stilte ---
+  - delay: "00:03:00"
+  - action: input_text.set_value
+    target: { entity_id: input_text.teams_status }
+    data: { value: "Offline" }
+  - action: input_boolean.turn_off
+    target:
+      entity_id:
+        - input_boolean.teams_in_gesprek
+        - input_boolean.teams_microfoon
+        - input_boolean.teams_camera
+  - action: input_text.set_value
+    target: { entity_id: [input_text.teams_microfoon_app, input_text.teams_camera_app] }
+    data: { value: "geen" }
+mode: restart

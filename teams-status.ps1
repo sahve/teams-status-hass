@@ -8,33 +8,33 @@
 #
 # Vereist: config.ps1 in dezelfde map (kopieer config.example.ps1).
 # ============================================================
-
+ 
 param(
     # Voer een testrun uit: stuur een reeks sample-payloads (alle statussen
     # + call-state) met 5 seconden ertussen en stop daarna. Handig om te
     # controleren of de webhook + Home Assistant-integratie werken.
     [switch]$test,
-
+ 
     # Toon een icoontje in het systeemvak (naast de klok) met de huidige
     # status, met een rechtsklikmenu om het script af te sluiten.
     [switch]$tray
 )
-
+ 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
+ 
 $configPath = Join-Path $PSScriptRoot "config.ps1"
 if (-not (Test-Path $configPath)) {
     Write-Error "config.ps1 niet gevonden. Kopieer config.example.ps1 naar config.ps1 en vul je eigen waarden in."
     exit 1
 }
 . $configPath
-
+ 
 # Verwijdert gevoelige gegevens (webhook-URL + het niet-raadbare webhook-ID)
 # uit foutmeldingen, zodat ze nooit in de CLI-logs terechtkomen.
 function Redact-Secret {
     param([string]$Text)
     if (-not $Text) { return $Text }
-
+ 
     # Het webhook-ID (het deel na /webhook/) is het echte geheim; het domein
     # is minder gevoelig maar redacten we voor de zekerheid ook.
     $webhookId = $null
@@ -43,40 +43,76 @@ function Redact-Secret {
     }
     if ($webhookUrl) { $Text = $Text.Replace($webhookUrl, "[WEBHOOK-URL]") }
     if ($webhookId)  { $Text = $Text.Replace($webhookId,  "[WEBHOOK-ID]") }
-
+ 
     return $Text
 }
-
-function Get-TeamsStatus {
-    param($LatestLogPath)
-
-    $statusLine = Select-String -Path $LatestLogPath -Pattern "availability:\s*(\w+)" |
-        Select-Object -Last 1
-
-    if ($statusLine) { $statusLine.Matches[0].Groups[1].Value } else { "Unknown" }
+ 
+# Incrementeel lezen van het Teams-log: we onthouden tot welke byte we gelezen
+# hebben en lezen bij elke check alleen wat er sindsdien bij is gekomen. Bij een
+# nieuw logbestand (rotatie) of een kleiner geworden bestand beginnen we vooraan.
+$script:tail = @{ Path = $null; Offset = 0L; Status = "Unknown"; InCall = $null }
+ 
+function Update-FromLog {
+    param([string]$Path)
+ 
+    if ($script:tail.Path -ne $Path) {
+        # Nieuw logbestand: vanaf het begin lezen. Status en call-state van het
+        # vorige bestand houden we vast tot het nieuwe bestand iets anders zegt.
+        $script:tail.Path = $Path
+        $script:tail.Offset = 0L
+    }
+ 
+    # Teams houdt het bestand open, dus delen met ReadWrite (en Delete, zodat
+    # we Teams' logrotatie niet blokkeren).
+    $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    try {
+        $len = $fs.Length
+        if ($len -lt $script:tail.Offset) { $script:tail.Offset = 0L }
+        if ($len -eq $script:tail.Offset) { return }
+ 
+        $null = $fs.Seek($script:tail.Offset, [System.IO.SeekOrigin]::Begin)
+        $count = [int]($len - $script:tail.Offset)
+        $buf = New-Object byte[] $count
+        $read = 0
+        while ($read -lt $count) {
+            $n = $fs.Read($buf, $read, $count - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+        if ($read -le 0) { return }
+ 
+        # Alleen complete regels verwerken; een half geschreven laatste regel
+        # pakken we de volgende keer mee.
+        $lastNewline = [Array]::LastIndexOf($buf, [byte]10, $read - 1)
+        if ($lastNewline -lt 0) { return }
+ 
+        $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $lastNewline + 1)
+        $script:tail.Offset += $lastNewline + 1
+    } finally {
+        $fs.Dispose()
+    }
+ 
+    $statusMatches = [regex]::Matches($text, 'availability:\s*(\w+)')
+    if ($statusMatches.Count -gt 0) {
+        $script:tail.Status = $statusMatches[$statusMatches.Count - 1].Groups[1].Value
+    }
+ 
+    $callMatches = [regex]::Matches($text, 'TeamsCallTracker: Call (became active|ended):')
+    if ($callMatches.Count -gt 0) {
+        $script:tail.InCall = ($callMatches[$callMatches.Count - 1].Groups[1].Value -eq 'became active')
+    }
 }
-
-function Get-TeamsCallState {
-    param($LatestLogPath, $PreviousInCall)
-
-    $callLine = Select-String -Path $LatestLogPath -Pattern "TeamsCallTracker: Call (became active|ended):" |
-        Select-Object -Last 1
-
-    # Geen call-event gevonden in dit (mogelijk net geroteerde) logbestand?
-    # Dan de vorige bekende call-state behouden i.p.v. een gok te maken.
-    if (-not $callLine) { return $PreviousInCall }
-
-    return ($callLine.Line -match "became active")
-}
-
+ 
 function Send-StatusUpdate {
     param($Status, $InCall)
-
+ 
     $payload = @{
         status  = $Status
         in_call = $InCall
     } | ConvertTo-Json
-
+ 
     $params = @{
         Uri         = $webhookUrl
         Method      = "Post"
@@ -88,15 +124,15 @@ function Send-StatusUpdate {
         $params["Proxy"] = $proxyUrl
         $params["ProxyUseDefaultCredentials"] = $true
     }
-
+ 
     Invoke-RestMethod @params
 }
-
+ 
 # --- Testmodus: stuur sample-payloads en stop ---
 if ($test) {
     Write-Host "Testmodus: stuur sample-payloads naar de webhook en stop daarna." -ForegroundColor Cyan
     if ($proxyUrl) { Write-Host "Proxy: $proxyUrl" }
-
+ 
     # Statussen zonder gesprek, daarna met gesprek.
     $samples = @(
         @{ status = "Available"; in_call = $false },
@@ -106,7 +142,7 @@ if ($test) {
         @{ status = "Busy";     in_call = $true  },
         @{ status = "Available"; in_call = $false }
     )
-
+ 
     foreach ($sample in $samples) {
         Write-Host ("-> status={0,-9} in_call={1}" -f $sample.status, $sample.in_call) -NoNewline
         try {
@@ -115,24 +151,24 @@ if ($test) {
         } catch {
             Write-Host "  [FOUT: $(Redact-Secret $_.Exception.Message)]" -ForegroundColor Red
         }
-
+ 
         # Geen sleep na het laatste sample.
         if ($sample -ne $samples[-1]) {
             Start-Sleep -Seconds 5
         }
     }
-
+ 
     Write-Host "Testmodus klaar." -ForegroundColor Cyan
     exit 0
 }
-
+ 
 # Leest de laatste status uit de logs en stuurt 'm naar HA als hij gewijzigd is.
 # Geeft een object terug met de status, call-state en of het versturen lukte.
 function Invoke-StatusCheck {
     $latestLog = Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $latestLog) { return $null }
-
+ 
     # --- Vorige state inlezen ---
     $lastStatus = ""
     $lastInCall = $false
@@ -143,11 +179,13 @@ function Invoke-StatusCheck {
             $lastInCall = [bool]::Parse($saved[1])
         }
     }
-
-    $status = Get-TeamsStatus -LatestLogPath $latestLog.FullName
-    $inCall = Get-TeamsCallState -LatestLogPath $latestLog.FullName -PreviousInCall $lastInCall
+ 
+    Update-FromLog -Path $latestLog.FullName
+    $status = $script:tail.Status
+    # Nog geen call-event gezien? Dan de laatst bekende call-state aanhouden.
+    $inCall = if ($null -ne $script:tail.InCall) { $script:tail.InCall } else { $lastInCall }
     $ok = $true
-
+ 
     # --- Alleen versturen bij wijziging ---
     if ($status -ne $lastStatus -or $inCall -ne $lastInCall) {
         try {
@@ -161,20 +199,19 @@ function Invoke-StatusCheck {
             $ok = $false
         }
     }
-
+ 
     [pscustomobject]@{
         Status  = $status
         InCall  = $inCall
         Ok      = $ok
-        LogTime = $latestLog.LastWriteTime
     }
 }
-
+ 
 # --- Tray-modus: icoontje naast de klok ---
 if ($tray) {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
-
+ 
     # Maakt een 16x16 icoon met een gekleurd rondje.
     function New-DotIcon([System.Drawing.Color]$Color) {
         $bmp = New-Object System.Drawing.Bitmap 16, 16
@@ -186,54 +223,43 @@ if ($tray) {
         $g.Dispose(); $brush.Dispose()
         [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     }
-
+ 
     $icons = @{
         Green  = New-DotIcon ([System.Drawing.Color]::FromArgb(146, 195, 83))
         Red    = New-DotIcon ([System.Drawing.Color]::FromArgb(196, 49, 75))
         Yellow = New-DotIcon ([System.Drawing.Color]::FromArgb(252, 209, 22))
         Grey   = New-DotIcon ([System.Drawing.Color]::FromArgb(140, 140, 140))
     }
-
+ 
     $script:notify = New-Object System.Windows.Forms.NotifyIcon
     $script:notify.Icon = $icons.Grey
     $script:notify.Text = "Teams -> HA: starten..."
     $script:notify.Visible = $true
-
+ 
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $null = $menu.Items.Add("Nu opnieuw versturen", $null, {
         # State-file weg = volgende check stuurt de status sowieso opnieuw.
         Remove-Item $stateFile -ErrorAction SilentlyContinue
-        $script:lastLogTime = [datetime]::MinValue
     })
     $null = $menu.Items.Add("Afsluiten", $null, {
         $script:notify.Visible = $false
         [System.Windows.Forms.Application]::Exit()
     })
     $script:notify.ContextMenuStrip = $menu
-
-    $script:lastLogTime = [datetime]::MinValue
-    $script:lastOk = $true
-
+ 
+ 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 3000
     $timer.Add_Tick({
         try {
-            # Alleen de logs parsen als het logbestand gewijzigd is,
-            # of als de vorige verzending mislukte (retry).
-            $latest = Get-ChildItem -Path $logDir -Filter "MSTeams_20*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if (-not $latest) {
+            # Elke tick: alleen de nieuwe bytes van het log lezen (goedkoop).
+            $r = Invoke-StatusCheck
+            if (-not $r) {
                 $script:notify.Icon = $icons.Grey
                 $script:notify.Text = "Teams -> HA: geen Teams-logs gevonden"
                 return
             }
-            if ($latest.LastWriteTime -eq $script:lastLogTime -and $script:lastOk) { return }
-
-            $r = Invoke-StatusCheck
-            if (-not $r) { return }
-            $script:lastLogTime = $r.LogTime
-            $script:lastOk = $r.Ok
-
+ 
             $icon = switch -Regex ($r.Status) {
                 '^Available$'                        { $icons.Green }
                 '^(Busy|DoNotDisturb|Presenting)$'   { $icons.Red }
@@ -241,12 +267,12 @@ if ($tray) {
                 default                              { $icons.Grey }
             }
             if ($r.InCall) { $icon = $icons.Red }
-
+ 
             $text = "Teams: $($r.Status)"
             if ($r.InCall) { $text += " (in gesprek)" }
             if (-not $r.Ok) { $text += " - versturen mislukt"; $icon = $icons.Grey }
             if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
-
+ 
             $script:notify.Icon = $icon
             $script:notify.Text = $text
         } catch {
@@ -254,17 +280,17 @@ if ($tray) {
             $script:notify.Text = "Teams -> HA: fout, zie log"
         }
     })
-
+ 
     $timer.Start()
     [System.Windows.Forms.Application]::Run()
-
+ 
     $timer.Stop()
     $script:notify.Dispose()
     exit 0
 }
-
+ 
 Write-Host "Teams status -> Home Assistant gestart. Ctrl+C om te stoppen."
-
+ 
 # Bestandswatcher op de Teams-logmap. In plaats van een vaste sleep wachten we
 # passief op een wijziging (lagere latency, geen periodieke wake-ups). De timeout
 # (pollIntervalSeconds) is alleen een veiligheidsnet voor gemiste events, bv. bij
@@ -285,10 +311,10 @@ if (Test-Path $logDir) {
 } else {
     Write-Warning "Logmap niet gevonden: $logDir"
 }
-
+ 
 while ($true) {
     $null = Invoke-StatusCheck
-
+ 
     # Wacht tot het logbestand wijzigt of roteert. Bij timeout (geen wijziging
     # binnen pollIntervalSeconds) loopt de lus gewoon door en wordt er opnieuw
     # gecheckt; dat vangt eventuele gemiste events op.
@@ -301,3 +327,4 @@ while ($true) {
         Start-Sleep -Seconds $pollIntervalSeconds
     }
 }
+ 
